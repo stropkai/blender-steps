@@ -1,6 +1,10 @@
 {
   "name": "blender-steps",
-  "owner": { "name": "STROPK.AI", "url": "https://stropk.ai" },
+  "description": "Claude Code skill for building 3D scenes in local headless Blender.",
+  "owner": {
+    "name": "STROPK.AI",
+    "url": "https://stropk.ai"
+  },
   "plugins": [
     {
       "name": "blender-steps",
