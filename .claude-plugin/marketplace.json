@@ -1,0 +1,11 @@
+{
+  "name": "blender-steps",
+  "owner": { "name": "STROPK.AI", "url": "https://stropk.ai" },
+  "plugins": [
+    {
+      "name": "blender-steps",
+      "source": "./",
+      "description": "Build 3D scenes in local headless Blender from small, revisioned Python steps."
+    }
+  ]
+}

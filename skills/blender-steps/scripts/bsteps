@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""bsteps: build Blender scenes headless, one committed Python step at a time.
+
+A project is a folder with one live scene.blend, numbered revisions, and a revision log.
+Mutations run a Python step against the scene and commit a new revision only if the step
+succeeds (a failed or timed-out step commits nothing). Queries and renders never change it.
+
+Usage:
+  bsteps new <slug> [--fps 24] [--res 1920x1080]       create ~/blender-steps/<slug>/ (empty metric scene, r000)
+  bsteps run <slug> <step.py> [--note "..."]          mutate: run step, commit next revision
+                                                  (write step files in <project>/drafts/; bsteps files a copy in steps/)
+  bsteps query <slug> <query.py | -e "code">          read-only Python against the current scene (prints, never saves)
+  bsteps audit <slug>                                 structural audit: objects, camera, lights, frame range, warnings
+  bsteps render <slug> [--engine eevee|workbench|cycles] [--res 960x540] [--samples 16]
+                   [--frame N | --frames 1,24,48] [--view camera|front|back|right|left|top] [--name tag]
+                                                  ortho views use Blender's names: front looks from -Y, right from +X
+                                                  still(s) from the active camera (or an ortho view) into renders/
+  bsteps video <slug> [--engine eevee|workbench] [--res 640x360] [--samples 8] [--start N --end N]
+                                                  render the frame range to PNGs, then ffmpeg -> renders/<rev>-anim.mp4
+  bsteps export <slug> glb|blend                      write exports/<slug>-r<rev>.glb (or .blend)
+  bsteps log <slug>                                   revision history
+  bsteps revert <slug> <rev>                          restore revision <rev> as a NEW revision (history is never rewritten)
+
+Every Blender call has a deadline (--timeout seconds, default 300). Env: BLENDER (binary), BSTEPS_HOME (projects root, default ~/blender-steps).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RUNNER = HERE / "bsteps_runner.py"
+BLENDER = os.environ.get("BLENDER") or shutil.which("blender") or "/Applications/Blender.app/Contents/MacOS/Blender"
+HOME = Path(os.environ.get("BSTEPS_HOME", Path.home() / "blender-steps"))
+
+
+def die(msg, code=1):
+    print(f"bsteps: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def project(slug, must_exist=True):
+    p = HOME / slug
+    if must_exist and not (p / "scene.blend").exists():
+        die(f"no project '{slug}' at {p} (run: bsteps new {slug})")
+    return p
+
+
+def log_rows(p):
+    f = p / "revisions.tsv"
+    if not f.exists():
+        return []
+    rows = []
+    for line in f.read_text().splitlines()[1:]:
+        if line.strip():
+            rev, when, kind, step, note = (line.split("\t") + [""] * 5)[:5]
+            rows.append({"rev": int(rev), "when": when, "kind": kind, "step": step, "note": note})
+    return rows
+
+
+def current_rev(p):
+    rows = log_rows(p)
+    return rows[-1]["rev"] if rows else -1
+
+
+def append_log(p, rev, kind, step, note):
+    f = p / "revisions.tsv"
+    if not f.exists():
+        f.write_text("rev\twhen\tkind\tstep\tnote\n")
+    when = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    note = note.replace("\t", " ").replace("\n", " ")
+    with f.open("a") as fh:
+        fh.write(f"{rev}\t{when}\t{kind}\t{step}\t{note}\n")
+
+
+def blender(args, timeout, blend=None):
+    """Run Blender headless with the runner; returns (exit_code, stdout_tail)."""
+    cmd = [BLENDER, "-b"]
+    if blend:
+        cmd.append(str(blend))
+    else:
+        cmd.append("--factory-startup")
+    cmd += ["--python-exit-code", "3", "--python", str(RUNNER), "--"] + args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die(f"Blender passed the {timeout}s deadline; nothing was committed. Split the step or lower the render cost.", 4)
+    out = r.stdout + r.stderr
+    # Show only the runner's own lines plus tracebacks; Blender's startup chatter is noise.
+    # Keep everything a step printed (between the runner's markers), the runner's own BS lines and
+    # any traceback; drop Blender's startup and render chatter.
+    keep, in_step, in_tb = [], False, False
+    for line in out.splitlines():
+        if line == "BS-OUT-BEGIN":
+            in_step = True
+            continue
+        if line == "BS-OUT-END":
+            in_step = False
+            continue
+        if line.startswith("Traceback"):
+            in_tb = True
+        elif line.startswith(("BS ", "Blender ")):
+            in_tb = False
+        if in_step or in_tb or line.startswith(("BS ", "BS|", "Error", "ERROR")):
+            keep.append(line)
+    return r.returncode, "\n".join(keep)
+
+
+def cmd_new(a):
+    p = project(a.slug, must_exist=False)
+    if (p / "scene.blend").exists():
+        die(f"project '{a.slug}' already exists at {p}")
+    for d in ("drafts", "steps", "revisions", "renders", "exports"):
+        (p / d).mkdir(parents=True, exist_ok=True)
+    w, h = a.res.split("x")
+    code, out = blender(["new", "--project", str(p), "--fps", str(a.fps), "--res", w, h], a.timeout)
+    print(out, flush=True)
+    if code != 0:
+        die("could not create the scene", code)
+    shutil.copy2(p / "scene.blend", p / "revisions" / "r000.blend")
+    append_log(p, 0, "new", "-", "empty metric scene")
+    brief = p / "brief.md"
+    if not brief.exists():
+        brief.write_text(BRIEF)
+    print(f"BS project {p}  (revision 0). Fill in {brief} before the first build step.")
+
+
+def cmd_run(a):
+    p = project(a.slug)
+    step = Path(a.step).resolve()
+    if not step.exists():
+        die(f"step file not found: {step}")
+    rev = current_rev(p) + 1
+    # Keep a copy of every step that ran, so the revision history reads as a sequence of intentions.
+    kept = p / "steps" / f"r{rev:03d}-{step.name}"
+    tmp_out = p / ".pending.blend"
+    if tmp_out.exists():
+        tmp_out.unlink()
+    code, out = blender(["run", "--project", str(p), "--step", str(step), "--save", str(tmp_out)], a.timeout,
+                        blend=p / "scene.blend")
+    print(out, flush=True)
+    if code != 0 or not tmp_out.exists():
+        if tmp_out.exists():
+            tmp_out.unlink()
+        die(f"step failed; scene stays at revision {rev - 1}", code or 1)
+    if step != kept:
+        shutil.copy2(step, kept)
+    os.replace(tmp_out, p / "scene.blend")
+    shutil.copy2(p / "scene.blend", p / "revisions" / f"r{rev:03d}.blend")
+    append_log(p, rev, "run", kept.name, a.note or "")
+    print(f"BS committed revision {rev}")
+
+
+def cmd_query(a):
+    p = project(a.slug)
+    if a.e:
+        q = p / ".query.py"
+        q.write_text(a.e)
+    elif a.file:
+        q = Path(a.file).resolve()
+    else:
+        die("give a query file or -e 'code'")
+    code, out = blender(["query", "--project", str(p), "--step", str(q)], a.timeout, blend=p / "scene.blend")
+    print(out, flush=True)
+    sys.exit(code)
+
+
+def cmd_audit(a):
+    p = project(a.slug)
+    code, out = blender(["audit", "--project", str(p)], a.timeout, blend=p / "scene.blend")
+    print(out, flush=True)
+    sys.exit(code)
+
+
+def cmd_render(a):
+    p = project(a.slug)
+    rev = current_rev(p)
+    if a.view == "side":
+        a.view = "right"
+    frames = a.frames or (str(a.frame) if a.frame is not None else "")
+    w, h = a.res.split("x")
+    args = ["render", "--project", str(p), "--rev", str(rev), "--engine", a.engine, "--res", w, h,
+            "--samples", str(a.samples), "--view", a.view, "--name", a.name or "", "--frames", frames]
+    code, out = blender(args, a.timeout, blend=p / "scene.blend")
+    print(out, flush=True)
+    if code != 0:
+        die("render failed", code)
+    print("BS Look at every image listed above (Read it) before judging the scene.")
+
+
+def cmd_video(a):
+    p = project(a.slug)
+    if not shutil.which("ffmpeg"):
+        die("ffmpeg not found; render stills instead or install ffmpeg")
+    rev = current_rev(p)
+    w, h = a.res.split("x")
+    fdir = p / "renders" / f"r{rev:03d}-frames"
+    if fdir.exists():
+        shutil.rmtree(fdir)
+    fdir.mkdir(parents=True)
+    args = ["video", "--project", str(p), "--rev", str(rev), "--engine", a.engine, "--res", w, h,
+            "--samples", str(a.samples), "--outdir", str(fdir)]
+    if a.start is not None:
+        args += ["--start", str(a.start)]
+    if a.end is not None:
+        args += ["--end", str(a.end)]
+    code, out = blender(args, a.timeout, blend=p / "scene.blend")
+    print(out, flush=True)
+    if code != 0:
+        die("frame render failed", code)
+    meta = json.loads((fdir / "meta.json").read_text())
+    mp4 = p / "renders" / f"r{rev:03d}-anim.mp4"
+    ff = ["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(meta["fps"]), "-start_number", str(meta["start"]),
+          "-i", str(fdir / "f%04d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+          "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", str(mp4)]
+    r = subprocess.run(ff, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"ffmpeg failed: {r.stderr.strip()}")
+    print(f"BS video {mp4}  ({meta['end'] - meta['start'] + 1} frames @ {meta['fps']} fps)")
+    print(f"BS frames kept in {fdir}; Read the rest/peak/final frames before calling the motion done.")
+
+
+def cmd_export(a):
+    p = project(a.slug)
+    rev = current_rev(p)
+    out = p / "exports" / f"{a.slug}-r{rev:03d}.{a.fmt}"
+    if a.fmt == "blend":
+        shutil.copy2(p / "scene.blend", out)
+        print(f"BS export {out}")
+        return
+    code, txt = blender(["export", "--project", str(p), "--out", str(out)], a.timeout, blend=p / "scene.blend")
+    print(txt)
+    if code != 0 or not out.exists():
+        die("GLB export failed", code or 1)
+    print(f"BS export {out}  ({out.stat().st_size // 1024} KiB)")
+
+
+def cmd_log(a):
+    p = project(a.slug)
+    print((p / "revisions.tsv").read_text())
+
+
+def cmd_revert(a):
+    p = project(a.slug)
+    src = p / "revisions" / f"r{a.rev:03d}.blend"
+    if not src.exists():
+        die(f"no revision {a.rev}")
+    rev = current_rev(p) + 1
+    shutil.copy2(src, p / "scene.blend")
+    shutil.copy2(src, p / "revisions" / f"r{rev:03d}.blend")
+    append_log(p, rev, "revert", f"r{a.rev:03d}", f"restored revision {a.rev}")
+    print(f"BS revision {rev} = copy of revision {a.rev}")
+
+
+BRIEF = """# Brief
+
+Write this before the first build step. Each render is checked against it.
+
+Deliverable:   (still / turntable / short clip / GLB / .blend), resolution, length
+Subject:       what the viewer should look at first
+Objects:       name | real size in metres | how much detail it needs
+Camera:        lens in mm, height, distance, what is in front of and behind the subject
+Materials:     palette, and which surfaces are glossy, metal, glass or emissive
+Lights:        where the main light comes from and why; how dark the shadows may go
+Motion:        fps, frame range, what moves, the frame that holds still (or "static")
+Done when:     the things that must be visibly true in the final render
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="bsteps", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--timeout", type=int, default=300)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("new"); s.add_argument("slug"); s.add_argument("--fps", type=int, default=24)
+    s.add_argument("--res", default="1920x1080"); s.set_defaults(fn=cmd_new)
+    s = sub.add_parser("run"); s.add_argument("slug"); s.add_argument("step"); s.add_argument("--note")
+    s.set_defaults(fn=cmd_run)
+    s = sub.add_parser("query"); s.add_argument("slug"); s.add_argument("file", nargs="?"); s.add_argument("-e")
+    s.set_defaults(fn=cmd_query)
+    s = sub.add_parser("audit"); s.add_argument("slug"); s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser("render"); s.add_argument("slug")
+    s.add_argument("--engine", default="eevee", choices=["eevee", "workbench", "cycles"])
+    s.add_argument("--res", default="960x540"); s.add_argument("--samples", type=int, default=16)
+    s.add_argument("--frame", type=int); s.add_argument("--frames")
+    s.add_argument("--view", default="camera", choices=["camera", "front", "back", "right", "left", "side", "top"])
+    s.add_argument("--name"); s.set_defaults(fn=cmd_render)
+    s = sub.add_parser("video"); s.add_argument("slug")
+    s.add_argument("--engine", default="eevee", choices=["eevee", "workbench"])
+    s.add_argument("--res", default="640x360"); s.add_argument("--samples", type=int, default=8)
+    s.add_argument("--start", type=int); s.add_argument("--end", type=int); s.set_defaults(fn=cmd_video)
+    s = sub.add_parser("export"); s.add_argument("slug"); s.add_argument("fmt", choices=["glb", "blend"])
+    s.set_defaults(fn=cmd_export)
+    s = sub.add_parser("log"); s.add_argument("slug"); s.set_defaults(fn=cmd_log)
+    s = sub.add_parser("revert"); s.add_argument("slug"); s.add_argument("rev", type=int); s.set_defaults(fn=cmd_revert)
+
+    a = ap.parse_args()
+    if not Path(BLENDER).exists():
+        die(f"Blender not found at {BLENDER} (set BLENDER=/path/to/Blender)")
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

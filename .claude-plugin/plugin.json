@@ -1,0 +1,10 @@
+{
+  "name": "blender-steps",
+  "version": "0.1.0",
+  "description": "Build 3D scenes in local headless Blender from small, revisioned Python steps, and check every render before calling it done.",
+  "author": { "name": "STROPK.AI", "url": "https://stropk.ai" },
+  "homepage": "https://github.com/stropkai/blender-steps",
+  "repository": "https://github.com/stropkai/blender-steps",
+  "license": "MIT",
+  "keywords": ["blender", "3d", "render", "glb", "skill"]
+}
